@@ -1,0 +1,9 @@
+# Streamlit secrets (contains HF token) — never commit
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env

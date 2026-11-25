@@ -1,0 +1,10 @@
+# CPU-only PyTorch wheels (avoids pulling ~2 GB of CUDA libraries on Streamlit Community Cloud).
+# If dependency resolution ever fails on the host, delete this line to fall back to PyPI wheels.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+streamlit
+torch
+torchvision
+huggingface_hub
+pillow
+pandas
