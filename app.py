@@ -94,12 +94,12 @@ class CNNClassifier(nn.Module):
 def get_hf_token() -> str | None:
     """Token from st.secrets, falling back to the HF_TOKEN env var. Never logged."""
     try:
-        token = st.secrets["HF_TOKEN"]
+        token = str(st.secrets["HF_TOKEN"]).strip()
         if token:
-            return str(token)
+            return token
     except Exception:  # no secrets.toml, or key missing
         pass
-    return os.environ.get("HF_TOKEN") or None
+    return (os.environ.get("HF_TOKEN") or "").strip() or None
 
 
 @st.cache_resource(show_spinner=False)
@@ -198,6 +198,14 @@ with st.sidebar:
         "- Often confuses **melanoma (MEL)** with **nevi (NV)**.\n"
         "- Probabilities are **not well calibrated**; treat them as relative scores."
     )
+
+if get_hf_token() is None:
+    st.error(
+        "No Hugging Face token found. Add `HF_TOKEN = \"hf_...\"` in the app's "
+        "**Settings → Secrets** on Streamlit Cloud (or `.streamlit/secrets.toml` locally), "
+        "then reboot the app."
+    )
+    st.stop()
 
 with st.spinner("Loading model (first load downloads ~285 MB)…"):
     try:
