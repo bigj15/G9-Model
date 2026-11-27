@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 
 import altair as alt
 import pandas as pd
@@ -43,6 +44,33 @@ CLASS_NAMES = {
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 LOW_CONFIDENCE = 0.5
+
+# Ground truth: the training runs' split manifest (all 10,015 HAM10000 images with
+# true class and split). Every run uses the same pinned dataset and split.
+GT_MANIFEST = "v2-align-fold0-20pct/results/split_manifest.csv"
+SPLIT_NOTES = {
+    "test": "HAM10000 **test** image: never used in training or model selection.",
+    "validation": "HAM10000 **validation** image: only used to choose the best epoch.",
+    "train_labeled": "HAM10000 **training** image (labelled): the model learned from it, "
+    "so a correct answer is expected.",
+    "train_unlabeled": "HAM10000 **training** image (unlabelled): seen in training without "
+    "its label.",
+}
+# External images (BCN20000, Hospital Clínic de Barcelona; CC-BY-NC) from the ISIC
+# Archive, for testing on data from another hospital. Labels from ISIC metadata.
+EXTERNAL_LABELS = {
+    **dict.fromkeys(["ISIC_0053454", "ISIC_0053456", "ISIC_0053460", "ISIC_0053469"], "MEL"),
+    **dict.fromkeys(["ISIC_0053453", "ISIC_0053458", "ISIC_0053459", "ISIC_0053482"], "NV"),
+    **dict.fromkeys(["ISIC_0053472", "ISIC_0053474", "ISIC_0053487", "ISIC_0053500"], "BCC"),
+    **dict.fromkeys(["ISIC_0053467", "ISIC_0053522", "ISIC_0053528", "ISIC_0053552"], "BKL"),
+    **dict.fromkeys(["ISIC_0053478", "ISIC_0053506", "ISIC_0053515", "ISIC_0053538"], "AKIEC"),
+    **dict.fromkeys(["ISIC_0053519", "ISIC_0053697", "ISIC_0053857", "ISIC_0053936"], "DF"),
+    **dict.fromkeys(["ISIC_0053779", "ISIC_0053862", "ISIC_0054000", "ISIC_0054084"], "VASC"),
+}
+EXTERNAL_NOTE = (
+    "**External** image (BCN20000, a different hospital): not from the training dataset."
+)
+ISIC_ID = re.compile(r"ISIC_\d{7}", re.IGNORECASE)
 MAX_FILES = 50  # keeps memory use reasonable on Streamlit Community Cloud
 BATCH_SIZE = 16  # images per forward pass
 
@@ -165,6 +193,31 @@ def load_model(filename: str) -> dict:
     }
 
 
+@st.cache_resource(show_spinner=False)
+def load_ground_truth() -> dict:
+    """Map ISIC image id -> {"label", "note"} from the training split manifest."""
+    path = hf_hub_download(
+        repo_id=HF_REPO_ID, filename=GT_MANIFEST, repo_type=HF_REPO_TYPE, token=get_hf_token()
+    )
+    df = pd.read_csv(path, usecols=["image_id", "class", "split", "labeled"])
+    gt = {}
+    cols = df[["image_id", "class", "split", "labeled"]]  # explicit order
+    for image_id, label, split, labeled in cols.itertuples(index=False):
+        key = split
+        if split == "train":
+            key = "train_labeled" if str(labeled).strip().lower() == "true" else "train_unlabeled"
+        gt[str(image_id).upper()] = {"label": str(label).upper(), "note": SPLIT_NOTES.get(key, "")}
+    for image_id, label in EXTERNAL_LABELS.items():
+        gt.setdefault(image_id.upper(), {"label": label, "note": EXTERNAL_NOTE})
+    return gt
+
+
+def lookup_truth(filename: str, gt: dict) -> dict | None:
+    """Find the ISIC id in the file name (e.g. ISIC_0027263.jpg) and return its label."""
+    m = ISIC_ID.search(filename)
+    return gt.get(m.group(0).upper()) if m else None
+
+
 def results_frame(probs: list[float]) -> pd.DataFrame:
     df = pd.DataFrame(
         {
@@ -191,8 +244,30 @@ def predict_batch(bundle: dict, images: list[Image.Image]) -> list[pd.DataFrame]
     return [results_frame(p) for p in all_probs]
 
 
-def show_detail(image: Image.Image, name: str, results: pd.DataFrame) -> None:
-    """Image on the left; top prediction, chart and table on the right."""
+def show_truth(truth: dict | None, predicted: str) -> None:
+    if not SHOW_TRUTH:
+        return
+    if truth is None:
+        st.caption(
+            "Ground truth: unknown (only shown when the file name is a known ISIC id, "
+            "e.g. `ISIC_0027263.jpg`)."
+        )
+        return
+    label = truth["label"]
+    if label == predicted:
+        st.success(f"Ground truth: **{label} — {CLASS_NAMES.get(label, label)}** ✅ correct")
+    else:
+        st.error(
+            f"Ground truth: **{label} — {CLASS_NAMES.get(label, label)}** ❌ "
+            f"the model predicted {predicted}"
+        )
+    st.caption(truth["note"])
+
+
+def show_detail(
+    image: Image.Image, name: str, results: pd.DataFrame, truth: dict | None = None
+) -> None:
+    """Image on the left; top prediction, ground truth, chart and table on the right."""
     top = results.iloc[0]
     col_img, col_res = st.columns([1, 1.4])
     with col_img:
@@ -209,6 +284,7 @@ def show_detail(image: Image.Image, name: str, results: pd.DataFrame) -> None:
                 f"Low confidence: the top probability is below {LOW_CONFIDENCE:.0%}. "
                 "The model is uncertain about this image."
             )
+        show_truth(truth, top["Code"])
 
         chart = (
             alt.Chart(results)
@@ -247,6 +323,14 @@ with st.sidebar:
     st.caption(f"`{HF_REPO_ID}` / `{spec['filename']}`")
 
     st.divider()
+    SHOW_TRUTH = st.toggle(
+        "Show ground truth when known",
+        value=True,
+        help="Matches the ISIC id in the file name (e.g. ISIC_0027263.jpg) to its true "
+        "diagnosis. Turn off for a 'blind' demo.",
+    )
+
+    st.divider()
     st.subheader("Known limits")
     st.markdown(
         "- Weak on **dermatofibroma (DF)**.\n"
@@ -272,6 +356,13 @@ with st.spinner("Loading model (first load downloads ~285 MB)…"):
             f"`{HF_REPO_ID}`.\n\n**Error:** {type(exc).__name__}: {exc}"
         )
         st.stop()
+
+ground_truth: dict = {}
+if SHOW_TRUTH:
+    try:
+        ground_truth = load_ground_truth()
+    except Exception as exc:  # the app still works without ground truth
+        st.sidebar.warning(f"Ground-truth labels unavailable ({type(exc).__name__}).")
 
 with st.sidebar:
     epoch = bundle["epoch"]
@@ -316,37 +407,59 @@ if not images:
 with st.spinner(f"Classifying {len(images)} image{'s' if len(images) > 1 else ''}…"):
     all_results = predict_batch(bundle, images)
 
+truths = [lookup_truth(n, ground_truth) for n in names]
+
+
+def mark(truth: dict | None, predicted: str) -> str:
+    if not SHOW_TRUTH or truth is None:
+        return ""
+    return "✅" if truth["label"] == predicted else "❌"
+
+
 if len(images) == 1:
-    show_detail(images[0], names[0], all_results[0])
+    show_detail(images[0], names[0], all_results[0], truths[0])
 else:
     # ---- Summary of every image ----
     rows = []
-    for i, (name, res) in enumerate(zip(names, all_results), start=1):
-        rows.append(
-            {
-                "#": i,
-                "File": name,
-                "Prediction": f"{res.iloc[0]['Code']} — {res.iloc[0]['Class']}",
-                "Confidence": res.iloc[0]["Probability"],
-                "Second guess": f"{res.iloc[1]['Code']} ({res.iloc[1]['Probability']:.0%})",
-                "Low confidence": "⚠️" if res.iloc[0]["Probability"] < LOW_CONFIDENCE else "",
-            }
-        )
+    for i, (name, res, truth) in enumerate(zip(names, all_results, truths), start=1):
+        row = {
+            "#": i,
+            "File": name,
+            "Prediction": f"{res.iloc[0]['Code']} — {res.iloc[0]['Class']}",
+            "Confidence": res.iloc[0]["Probability"],
+            "Second guess": f"{res.iloc[1]['Code']} ({res.iloc[1]['Probability']:.0%})",
+            "Low confidence": "⚠️" if res.iloc[0]["Probability"] < LOW_CONFIDENCE else "",
+        }
+        if SHOW_TRUTH:
+            row["Ground truth"] = truth["label"] if truth else "unknown"
+            row["Correct"] = mark(truth, res.iloc[0]["Code"]) or "—"
+        rows.append(row)
     summary = pd.DataFrame(rows)
 
     st.subheader(f"Results for {len(images)} images")
     counts = summary["Prediction"].str.split(" — ").str[0].value_counts()
     st.caption("Predicted classes: " + ", ".join(f"{c} × {n}" for c, n in counts.items()))
+    if SHOW_TRUTH:
+        known = [(t, r.iloc[0]["Code"]) for t, r in zip(truths, all_results) if t]
+        if known:
+            right = sum(t["label"] == p for t, p in known)
+            extra = f" ({len(images) - len(known)} without a known label)" if len(known) < len(images) else ""
+            st.markdown(f"**Correct on {right} of {len(known)} images with a known label**{extra}.")
     shown = summary.copy()
     shown["Confidence"] = shown["Confidence"].map(lambda p: f"{p:.1%}")
     st.dataframe(shown, hide_index=True, use_container_width=True)
 
     # CSV with every class probability for every image.
     csv_rows = []
-    for name, res in zip(names, all_results):
+    for name, res, truth in zip(names, all_results, truths):
         probs = dict(zip(res["Code"], res["Probability"]))
         csv_rows.append(
-            {"file": name, "predicted": res.iloc[0]["Code"], **{f"prob_{c}": probs[c] for c in CLASSES}}
+            {
+                "file": name,
+                "predicted": res.iloc[0]["Code"],
+                "true_label": truth["label"] if truth else "",
+                **{f"prob_{c}": probs[c] for c in CLASSES},
+            }
         )
     st.download_button(
         "Download all results (CSV)",
@@ -363,6 +476,9 @@ else:
         for col, i in zip(cols, range(start, min(start + cols_per_row, len(images)))):
             top = all_results[i].iloc[0]
             flag = " ⚠️" if top["Probability"] < LOW_CONFIDENCE else ""
+            tick = mark(truths[i], top["Code"])
+            if tick:
+                flag += f" {tick} true: {truths[i]['label']}"
             with col:
                 st.image(
                     images[i],
@@ -372,9 +488,10 @@ else:
 
     # ---- Full detail per image ----
     st.subheader("Details")
-    for i, (image, name, res) in enumerate(zip(images, names, all_results), start=1):
+    for i, (image, name, res, truth) in enumerate(zip(images, names, all_results, truths), start=1):
         top = res.iloc[0]
-        with st.expander(f"#{i} {name} — {top['Code']} ({top['Probability']:.1%})"):
-            show_detail(image, name, res)
+        tick = mark(truth, top["Code"])
+        with st.expander(f"#{i} {name} — {top['Code']} ({top['Probability']:.1%}) {tick}".rstrip()):
+            show_detail(image, name, res, truth)
 
 st.caption("Research demo only — not a medical device, not for diagnosis.")
