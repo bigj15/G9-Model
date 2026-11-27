@@ -1,7 +1,7 @@
 """Streamlit demo: 7-class skin-lesion classifier (HAM10000 / ISIC 2018).
 
 Loads a trained checkpoint from a private Hugging Face model repo and classifies
-an uploaded dermoscopic image using the CNN head (ResNet-50 encoder + linear head).
+uploaded dermoscopic images (one or many at once) using the CNN head (ResNet-50 encoder + linear head).
 
 RESEARCH DEMO ONLY. Not a medical device. Not for diagnosis.
 Training code: https://github.com/bigj15/GNAL-Skin-Lesion-Diagnosis-G9
@@ -43,9 +43,19 @@ CLASS_NAMES = {
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 LOW_CONFIDENCE = 0.5
+MAX_FILES = 50  # keeps memory use reasonable on Streamlit Community Cloud
+BATCH_SIZE = 16  # images per forward pass
 
 MODELS = {
-    "CNN-only ResNet-50 (Experiment 2) — default": {
+    "GNAL + distribution alignment (Experiment 3) — default": {
+        "filename": "v2-align-fold0-20pct/checkpoints/epoch_013.pt",
+        "note": (
+            "Pretrained ResNet-50 GNAL trained with distribution-aligned pseudo-labels. "
+            "Held-out test with the same CNN-head prediction path this app uses: "
+            "**79.44% accuracy, 56.50% macro F1, 88.85% AUC**."
+        ),
+    },
+    "CNN-only ResNet-50 (Experiment 2)": {
         "filename": "pretrained-v1-cnnonly-fold0-20pct/checkpoints/epoch_019.pt",
         "note": (
             "CNN-only ResNet-50. Held-out test: **78.25% accuracy, 55.02% macro F1**, "
@@ -60,7 +70,6 @@ MODELS = {
         ),
     },
 }
-
 
 # ---------------------------------------------------------------------------
 # Model (attribute names mirror the training module so state_dict keys match)
@@ -156,12 +165,7 @@ def load_model(filename: str) -> dict:
     }
 
 
-def predict(bundle: dict, image: Image.Image) -> pd.DataFrame:
-    model = bundle["model"]
-    model.eval()
-    x = bundle["transform"](image.convert("RGB")).unsqueeze(0)
-    with torch.inference_mode():
-        probs = torch.softmax(model(x), dim=1)[0].tolist()
+def results_frame(probs: list[float]) -> pd.DataFrame:
     df = pd.DataFrame(
         {
             "Code": CLASSES,
@@ -170,6 +174,57 @@ def predict(bundle: dict, image: Image.Image) -> pd.DataFrame:
         }
     )
     return df.sort_values("Probability", ascending=False).reset_index(drop=True)
+
+
+def predict_batch(bundle: dict, images: list[Image.Image]) -> list[pd.DataFrame]:
+    """Classify several images, BATCH_SIZE at a time. The model is in eval mode, so
+    each image gets exactly the same result as it would on its own."""
+    model = bundle["model"]
+    model.eval()
+    transform = bundle["transform"]
+    all_probs: list[list[float]] = []
+    with torch.inference_mode():
+        for start in range(0, len(images), BATCH_SIZE):
+            chunk = images[start : start + BATCH_SIZE]
+            x = torch.stack([transform(img.convert("RGB")) for img in chunk])
+            all_probs.extend(torch.softmax(model(x), dim=1).tolist())
+    return [results_frame(p) for p in all_probs]
+
+
+def show_detail(image: Image.Image, name: str, results: pd.DataFrame) -> None:
+    """Image on the left; top prediction, chart and table on the right."""
+    top = results.iloc[0]
+    col_img, col_res = st.columns([1, 1.4])
+    with col_img:
+        st.image(image, caption=name, use_container_width=True)
+
+    with col_res:
+        st.subheader("Prediction")
+        st.metric(
+            label=f"{top['Code']} — {top['Class']}",
+            value=f"{top['Probability']:.1%}",
+        )
+        if top["Probability"] < LOW_CONFIDENCE:
+            st.warning(
+                f"Low confidence: the top probability is below {LOW_CONFIDENCE:.0%}. "
+                "The model is uncertain about this image."
+            )
+
+        chart = (
+            alt.Chart(results)
+            .mark_bar()
+            .encode(
+                x=alt.X("Probability:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
+                y=alt.Y("Code:N", sort="-x", title=None),
+                tooltip=["Code", "Class", alt.Tooltip("Probability:Q", format=".2%")],
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        table = results.copy()
+        table["Probability"] = table["Probability"].map(lambda p: f"{p:.2%}")
+        st.dataframe(table, hide_index=True, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -228,51 +283,98 @@ with st.sidebar:
         f"ImageNet normalization: {'on' if bundle['imagenet_normalize'] else 'off'}"
     )
 
-uploaded = st.file_uploader("Upload a dermoscopic image", type=["jpg", "jpeg", "png"])
+uploads = st.file_uploader(
+    "Upload one or more dermoscopic images",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+)
 
-if uploaded is None:
-    st.info("Upload a JPG or PNG dermoscopic image to get a prediction.")
+if not uploads:
+    st.info(
+        "Upload one or more JPG or PNG dermoscopic images to get predictions. "
+        f"You can select up to {MAX_FILES} files at once."
+    )
     st.stop()
 
-try:
-    image = Image.open(uploaded).convert("RGB")
-except Exception as exc:
-    st.error(f"Could not read the image: {exc}")
+if len(uploads) > MAX_FILES:
+    st.warning(f"{len(uploads)} files selected; only the first {MAX_FILES} are classified.")
+    uploads = uploads[:MAX_FILES]
+
+images: list[Image.Image] = []
+names: list[str] = []
+for up in uploads:
+    try:
+        images.append(Image.open(up).convert("RGB"))
+        names.append(up.name)
+    except Exception as exc:
+        st.warning(f"Skipped **{up.name}**: could not read the image ({exc}).")
+
+if not images:
+    st.error("None of the uploaded files could be read as images.")
     st.stop()
 
-results = predict(bundle, image)
-top = results.iloc[0]
+with st.spinner(f"Classifying {len(images)} image{'s' if len(images) > 1 else ''}…"):
+    all_results = predict_batch(bundle, images)
 
-col_img, col_res = st.columns([1, 1.4])
-with col_img:
-    st.image(image, caption=uploaded.name, use_container_width=True)
-
-with col_res:
-    st.subheader("Prediction")
-    st.metric(
-        label=f"{top['Code']} — {top['Class']}",
-        value=f"{top['Probability']:.1%}",
-    )
-    if top["Probability"] < LOW_CONFIDENCE:
-        st.warning(
-            f"Low confidence: the top probability is below {LOW_CONFIDENCE:.0%}. "
-            "The model is uncertain about this image."
+if len(images) == 1:
+    show_detail(images[0], names[0], all_results[0])
+else:
+    # ---- Summary of every image ----
+    rows = []
+    for i, (name, res) in enumerate(zip(names, all_results), start=1):
+        rows.append(
+            {
+                "#": i,
+                "File": name,
+                "Prediction": f"{res.iloc[0]['Code']} — {res.iloc[0]['Class']}",
+                "Confidence": res.iloc[0]["Probability"],
+                "Second guess": f"{res.iloc[1]['Code']} ({res.iloc[1]['Probability']:.0%})",
+                "Low confidence": "⚠️" if res.iloc[0]["Probability"] < LOW_CONFIDENCE else "",
+            }
         )
+    summary = pd.DataFrame(rows)
 
-    chart = (
-        alt.Chart(results)
-        .mark_bar()
-        .encode(
-            x=alt.X("Probability:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
-            y=alt.Y("Code:N", sort="-x", title=None),
-            tooltip=["Code", "Class", alt.Tooltip("Probability:Q", format=".2%")],
+    st.subheader(f"Results for {len(images)} images")
+    counts = summary["Prediction"].str.split(" — ").str[0].value_counts()
+    st.caption("Predicted classes: " + ", ".join(f"{c} × {n}" for c, n in counts.items()))
+    shown = summary.copy()
+    shown["Confidence"] = shown["Confidence"].map(lambda p: f"{p:.1%}")
+    st.dataframe(shown, hide_index=True, use_container_width=True)
+
+    # CSV with every class probability for every image.
+    csv_rows = []
+    for name, res in zip(names, all_results):
+        probs = dict(zip(res["Code"], res["Probability"]))
+        csv_rows.append(
+            {"file": name, "predicted": res.iloc[0]["Code"], **{f"prob_{c}": probs[c] for c in CLASSES}}
         )
-        .properties(height=260)
+    st.download_button(
+        "Download all results (CSV)",
+        pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8"),
+        file_name="predictions.csv",
+        mime="text/csv",
     )
-    st.altair_chart(chart, use_container_width=True)
 
-    table = results.copy()
-    table["Probability"] = table["Probability"].map(lambda p: f"{p:.2%}")
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    # ---- Thumbnail gallery ----
+    st.subheader("Gallery")
+    cols_per_row = 4
+    for start in range(0, len(images), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for col, i in zip(cols, range(start, min(start + cols_per_row, len(images)))):
+            top = all_results[i].iloc[0]
+            flag = " ⚠️" if top["Probability"] < LOW_CONFIDENCE else ""
+            with col:
+                st.image(
+                    images[i],
+                    caption=f"#{i + 1} {top['Code']} {top['Probability']:.0%}{flag}",
+                    use_container_width=True,
+                )
+
+    # ---- Full detail per image ----
+    st.subheader("Details")
+    for i, (image, name, res) in enumerate(zip(images, names, all_results), start=1):
+        top = res.iloc[0]
+        with st.expander(f"#{i} {name} — {top['Code']} ({top['Probability']:.1%})"):
+            show_detail(image, name, res)
 
 st.caption("Research demo only — not a medical device, not for diagnosis.")
